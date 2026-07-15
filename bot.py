@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -10,6 +11,8 @@ from discord import app_commands
 from discord.ext import commands
 import jmcomic
 from groq import Groq
+from flask import Flask
+from waitress import serve
 
 logging.basicConfig(
     level=logging.INFO,
@@ -292,6 +295,28 @@ class SearchBot(commands.Bot):
             logging.error(f"底層套件解包查詢時發生異常: {e}", exc_info=True)
             return []
 
+web_app = Flask(__name__)
+
+@web_app.get("/")
+def home():
+    return {
+        "status": "online",
+        "service": "discord-bot"
+    }, 200
+
+@web_app.get("/health")
+def health():
+    return {
+        "status": "healthy"
+    }, 200
+
+def run_web_server() -> None:
+    port = int(os.getenv("PORT", "10000"))
+    serve(
+        web_app,
+        host="0.0.0.0",
+        port=port,
+    )
 
 bot = SearchBot()
 
@@ -398,5 +423,11 @@ async def search_command_error(
         await interaction.followup.send(message, ephemeral=True)
     else:
         await interaction.response.send_message(message, ephemeral=True)
+
+web_thread = threading.Thread(
+    target=run_web_server,
+    daemon=True,
+)
+web_thread.start()
 
 bot.run(TOKEN)
