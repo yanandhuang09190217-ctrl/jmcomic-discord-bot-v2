@@ -1,11 +1,13 @@
 from __future__ import annotations
 import asyncio
+import io
 import logging
 import os
 import threading
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlencode
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -64,7 +66,6 @@ def generate_ai_cover_url(title: str, author: str | None) -> str:
             "model": "flux",
             "nologo": "true",
             "seed": -1,
-            "key": POLLINATIONS_KEY,
         }
     )
     return (
@@ -72,35 +73,128 @@ def generate_ai_cover_url(title: str, author: str | None) -> str:
         f"{encoded_prompt}?{parameters}"
     )
 
+async def download_ai_cover(
+    title: str,
+    author: str | None,
+) -> tuple[bytes | None, str | None, str | None]:
+    url = generate_ai_cover_url(title, author)
+    timeout = aiohttp.ClientTimeout(total=90)
+    headers = {
+        "Authorization": f"Bearer {POLLINATIONS_KEY}",
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as response:
+                content_type = response.headers.get(
+                    "Content-Type",
+                    "",
+                ).lower()
+                if response.status != 200:
+                    error_text = await response.text()
+                    logging.error(
+                        "Pollinations 生成失敗：HTTP %s | %s",
+                        response.status,
+                        error_text[:300],
+                    )
+                    return None, None, f"HTTP {response.status}"
+                if not content_type.startswith("image/"):
+                    error_text = await response.text()
+                    logging.error(
+                        "Pollinations 回傳非圖片：%s | %s",
+                        content_type,
+                        error_text[:300],
+                    )
+                    return None, None, "回傳內容不是圖片"
+                image_bytes = await response.read()
+                if "png" in content_type:
+                    extension = "png"
+                elif "webp" in content_type:
+                    extension = "webp"
+                else:
+                    extension = "jpg"
+                logging.info(
+                    "AI 封面下載成功：%s bytes | %s",
+                    len(image_bytes),
+                    content_type,
+                )
+                return image_bytes, extension, None
+    except TimeoutError:
+        logging.error("Pollinations 圖片生成逾時。")
+        return None, None, "圖片生成逾時"
+    except aiohttp.ClientError as error:
+        logging.error(
+            "Pollinations 連線失敗：%s",
+            error,
+        )
+        return None, None, "圖片服務連線失敗"
+    except Exception:
+        logging.exception("AI 封面處理發生未預期錯誤。")
+        return None, None, "圖片處理發生錯誤"
+
 def get_discord_proxy_url(url: str | None) -> str | None:
     if not url:
         return None
     return f"https://discordapp.net{quote(url.replace('https://', '').replace('http://', ''))}"
-
 def build_result_embed(
     result: SearchResult,
     keyword: str,
     index: int,
     total: int,
     ai_cover_url: str | None = None,
+    image_error: str | None = None,
 ) -> discord.Embed:
-    description_parts = []
-    if result.author:
-        description_parts.append(f"**作者：** {result.author}")
-    description_parts.append(f"**作品 ID：** {result.id}")
-    description_parts.append(f"**搜尋關鍵字：** {keyword}")
-    description_parts.append("\n💡 *點擊上方藍色標題可前往網頁*")
     embed = discord.Embed(
-        title=limited_text(result.title, 256, "未命名作品"),
+        title=limited_text(
+            result.title,
+            256,
+            "未命名作品",
+        ),
         url=result.detail_url,
-        description="\n".join(description_parts),
-        color=discord.Color.blurple(),
+        description=(
+            "✨ **搜尋完成**\n"
+            "使用下方按鈕切換其他搜尋結果。"
+        ),
+        color=discord.Color.from_rgb(
+            88,
+            101,
+            242,
+        ),
+        timestamp=discord.utils.utcnow(),
     )
+    embed.add_field(
+        name="👤 作者",
+        value=limited_text(
+            result.author,
+            1024,
+            "未知作者",
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🆔 作品 ID",
+        value=f"`{limited_text(result.id, 100, '未知')}`",
+        inline=True,
+    )
+    embed.add_field(
+        name="🔎 搜尋關鍵字",
+        value=f"`{limited_text(keyword, 100, '未提供')}`",
+        inline=False,
+    )
+    if image_error:
+        embed.add_field(
+            name="🖼️ 封面狀態",
+            value=f"生成失敗：`{image_error}`",
+            inline=False,
+        )
     image_url = ai_cover_url or result.cover_url
     if image_url:
         embed.set_image(url=image_url)
     embed.set_footer(
-        text=f"搜尋結果 {index + 1}/{total}"
+        text=(
+            f"第 {index + 1} / {total} 筆"
+            " • 按鈕將在 120 秒後停用"
+        )
     )
     return embed
 
@@ -112,26 +206,45 @@ class SearchResultsView(discord.ui.View):
         self.results = results
         self.index = 0
         self.message = None
-        self.ai_covers_cache: dict[int, str] = {}
+        self.ai_covers_cache: dict[int, tuple[bytes, str]] = {}
         self.update_buttons()
 
-    async def current_embed(self) -> discord.Embed:
+        async def current_page(
+        self,
+    ) -> tuple[discord.Embed, discord.File | None]:
         current_result = self.results[self.index]
-        cover_url = self.ai_covers_cache.get(self.index)
-        if cover_url is None:
-            cover_url = generate_ai_cover_url(
+        cached_cover = self.ai_covers_cache.get(self.index)
+        image_error = None
+        if cached_cover is None:
+            image_bytes, extension, image_error = await download_ai_cover(
                 current_result.title,
                 current_result.author,
             )
-            self.ai_covers_cache[self.index] = cover_url
-        logging.info("AI 圖片網址已成功產生，結果頁數：%s", self.index + 1)
-        return build_result_embed(
+            if image_bytes is not None and extension is not None:
+                cached_cover = (
+                    image_bytes,
+                    extension,
+                )
+                self.ai_covers_cache[self.index] = cached_cover
+        image_file = None
+        image_url = None
+        if cached_cover is not None:
+            image_bytes, extension = cached_cover
+            filename = f"cover_{self.index}.{extension}"
+            image_file = discord.File(
+                io.BytesIO(image_bytes),
+                filename=filename,
+            )
+            image_url = f"attachment://{filename}"
+        embed = build_result_embed(
             result=current_result,
             keyword=self.keyword,
             index=self.index,
             total=len(self.results),
-            ai_cover_url=cover_url,
+            ai_cover_url=image_url,
+            image_error=image_error,
         )
+        return embed, image_file
 
     def update_buttons(self) -> None:
         self.previous_button.disabled = self.index <= 0
@@ -158,7 +271,28 @@ class SearchResultsView(discord.ui.View):
                 await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
-
+        @discord.ui.button(
+        label="重新生成封面",
+        emoji="🎨",
+        style=discord.ButtonStyle.success,
+    )
+    async def regenerate_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        self.ai_covers_cache.pop(
+            self.index,
+            None,
+        )
+        await interaction.response.defer()
+        embed, image_file = await self.current_page()
+        await interaction.edit_original_response(
+            embed=embed,
+            attachments=[image_file] if image_file else [],
+            view=self,
+        )
+    
     @discord.ui.button(
         label="上一頁",
         emoji="⬅️",
@@ -174,8 +308,11 @@ class SearchResultsView(discord.ui.View):
             return
         self.index -= 1
         self.update_buttons()
-        await interaction.response.edit_message(
-            embed=await self.current_embed(),
+        await interaction.response.defer()
+        embed, image_file = await self.current_page()
+        await interaction.edit_original_response(
+            embed=embed,
+            attachments=[image_file] if image_file else [],
             view=self,
         )
 
@@ -194,8 +331,11 @@ class SearchResultsView(discord.ui.View):
             return
         self.index += 1
         self.update_buttons()
-        await interaction.response.edit_message(
-            embed=await self.current_embed(),
+        await interaction.response.defer()
+        embed, image_file = await self.current_page()
+        await interaction.edit_original_response(
+            embed=embed,
+            attachments=[image_file] if image_file else [],
             view=self,
         )
 
@@ -388,14 +528,17 @@ async def search_command(
         keyword=keyword,
         results=results,
     )
-
-    first_embed = await view.current_embed()
+    first_embed, first_file = await view.current_page()
     view.update_buttons()
-
+    send_options = {
+        "embed": first_embed,
+        "view": view,
+        "wait": True,
+    }
+    if first_file:
+        send_options["file"] = first_file
     message = await interaction.followup.send(
-        embed=first_embed,
-        view=view,
-        wait=True,
+        **send_options
     )
     view.message = message
 
