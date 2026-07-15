@@ -3,3 +3,4 @@ jmcomic
 groq
 flask
 waitress
+aiohttp
