@@ -63,9 +63,9 @@ def generate_ai_cover_prompt(
         "Create a family-friendly fictional anime comic book cover, "
         "cinematic lighting, detailed illustration, professional layout, "
         "vertical cover composition, vibrant colors, "
-        f"title text: {title}{author_text}. "
+        f"visual concept inspired by the title: {title}{author_text}. "
         "No nudity, no sexual content, no explicit content, "
-        "no gore, no watermark."
+        "no gore, no watermark, no words, no letters, no logo, clean composition."
     )
 
 async def download_ai_cover(
@@ -83,8 +83,8 @@ async def download_ai_cover(
     }
     payload = {
         "prompt": generate_ai_cover_prompt(title, author),
-        "steps": 4,
-        "seed": int.from_bytes(os.urandom(4), "big"),
+        "steps": 8,
+        "seed": abs(hash(title)) % 2147483647,
     }
     timeout = aiohttp.ClientTimeout(total=90)
     try:
