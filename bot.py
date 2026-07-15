@@ -209,7 +209,7 @@ class SearchResultsView(discord.ui.View):
         self.ai_covers_cache: dict[int, tuple[bytes, str]] = {}
         self.update_buttons()
 
-        async def current_page(
+    async def current_page(
         self,
     ) -> tuple[discord.Embed, discord.File | None]:
         current_result = self.results[self.index]
@@ -271,7 +271,7 @@ class SearchResultsView(discord.ui.View):
                 await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
-        @discord.ui.button(
+    @discord.ui.button(
         label="重新生成封面",
         emoji="🎨",
         style=discord.ButtonStyle.success,
