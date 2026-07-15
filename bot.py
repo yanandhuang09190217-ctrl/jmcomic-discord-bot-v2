@@ -1,4 +1,5 @@
 from __future__ import annotations
+import base64
 import asyncio
 import io
 import logging
@@ -23,14 +24,17 @@ logging.basicConfig(
 TOKEN = os.getenv("DISCORD_TOKEN")
 TEST_GUILD_ID = os.getenv("TEST_GUILD_ID")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-POLLINATIONS_KEY = os.getenv("POLLINATIONS_KEY")
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 SEARCH_LIMIT = 5
 REQUEST_TIMEOUT = 15
 if not TOKEN:
     raise RuntimeError("找不到 DISCORD_TOKEN 環境變數。")
-if not POLLINATIONS_KEY:
-    raise RuntimeError("找不到 POLLINATIONS_KEY 環境變數。")
-
+if not CLOUDFLARE_ACCOUNT_ID:
+    raise RuntimeError("找不到 CLOUDFLARE_ACCOUNT_ID 環境變數。")
+if not CLOUDFLARE_API_TOKEN:
+    raise RuntimeError("找不到 CLOUDFLARE_API_TOKEN 環境變數。")
+    
 @dataclass(slots=True, frozen=True)
 class SearchResult:
     id: str
@@ -39,7 +43,7 @@ class SearchResult:
     publish_year: int | None = None
     cover_url: str | None = None
     detail_url: str | None = None
-
+    
 def limited_text(value: Any, limit: int, fallback: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -48,88 +52,116 @@ def limited_text(value: Any, limit: int, fallback: str) -> str:
         return text
     return f"{text[:limit - 1]}…"
 
-def generate_ai_cover_url(title: str, author: str | None) -> str:
+def generate_ai_cover_prompt(
+    title: str,
+    author: str | None,
+) -> str:
     author_text = ""
     if author and "未知" not in author:
-        author_text = f", author name: {author}"
-    prompt = (
-        "A safe anime-style fictional comic book cover, "
-        "vibrant colors, highly detailed illustration, "
-        f"book title: {title}{author_text}, "
-        "no nudity, no sexual content, no explicit content"
-    )
-    encoded_prompt = quote(prompt, safe="")
-    parameters = urlencode(
-        {
-            "width": 768,
-            "height": 1024,
-            "model": "flux",
-            "nologo": "true",
-            "seed": -1,
-        }
-    )
+        author_text = f", credited author: {author}"
     return (
-        f"https://gen.pollinations.ai/image/"
-        f"{encoded_prompt}?{parameters}"
+        "Create a family-friendly fictional anime comic book cover, "
+        "cinematic lighting, detailed illustration, professional layout, "
+        "vertical cover composition, vibrant colors, "
+        f"title text: {title}{author_text}. "
+        "No nudity, no sexual content, no explicit content, "
+        "no gore, no watermark."
     )
 
 async def download_ai_cover(
     title: str,
     author: str | None,
 ) -> tuple[bytes | None, str | None, str | None]:
-    url = generate_ai_cover_url(title, author)
-    timeout = aiohttp.ClientTimeout(total=90)
+    api_url = (
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{CLOUDFLARE_ACCOUNT_ID}/ai/run/"
+        "@cf/black-forest-labs/flux-1-schnell"
+    )
     headers = {
-        "Authorization": f"Bearer {POLLINATIONS_KEY}",
+        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+        "Content-Type": "application/json",
     }
-
+    payload = {
+        "prompt": generate_ai_cover_prompt(title, author),
+        "steps": 4,
+        "seed": int.from_bytes(os.urandom(4), "big"),
+    }
+    timeout = aiohttp.ClientTimeout(total=90)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers) as response:
-                content_type = response.headers.get(
-                    "Content-Type",
-                    "",
-                ).lower()
+            async with session.post(
+                api_url,
+                headers=headers,
+                json=payload,
+            ) as response:
+                data = await response.json(content_type=None)
                 if response.status != 200:
-                    error_text = await response.text()
+                    error_detail = (
+                        data.get("errors", data)
+                        if isinstance(data, dict)
+                        else data
+                    )
                     logging.error(
-                        "Pollinations 生成失敗：HTTP %s | %s",
+                        "Cloudflare AI 生成失敗：HTTP %s | %s",
                         response.status,
-                        error_text[:300],
+                        str(error_detail)[:500],
                     )
-                    return None, None, f"HTTP {response.status}"
-                if not content_type.startswith("image/"):
-                    error_text = await response.text()
+                    return (
+                        None,
+                        None,
+                        f"Cloudflare HTTP {response.status}",
+                    )
+                if not isinstance(data, dict):
                     logging.error(
-                        "Pollinations 回傳非圖片：%s | %s",
-                        content_type,
-                        error_text[:300],
+                        "Cloudflare AI 回傳格式錯誤：%r",
+                        data,
                     )
-                    return None, None, "回傳內容不是圖片"
-                image_bytes = await response.read()
-                if "png" in content_type:
-                    extension = "png"
-                elif "webp" in content_type:
-                    extension = "webp"
-                else:
-                    extension = "jpg"
+                    return None, None, "圖片服務回傳格式錯誤"
+                result = data.get("result")
+                if not isinstance(result, dict):
+                    logging.error(
+                        "Cloudflare AI 缺少 result：%s",
+                        str(data)[:500],
+                    )
+                    return None, None, "圖片結果不存在"
+                image_base64 = result.get("image")
+                if not isinstance(image_base64, str):
+                    logging.error(
+                        "Cloudflare AI 缺少 image：%s",
+                        str(result)[:500],
+                    )
+                    return None, None, "圖片資料不存在"
+                try:
+                    image_bytes = base64.b64decode(
+                        image_base64,
+                        validate=True,
+                    )
+                except Exception:
+                    logging.exception(
+                        "Cloudflare AI 圖片 Base64 解碼失敗。"
+                    )
+                    return None, None, "圖片資料解碼失敗"
+                if not image_bytes:
+                    return None, None, "圖片內容為空"
+
                 logging.info(
-                    "AI 封面下載成功：%s bytes | %s",
+                    "Cloudflare AI 封面成功：%s bytes",
                     len(image_bytes),
-                    content_type,
                 )
-                return image_bytes, extension, None
-    except TimeoutError:
-        logging.error("Pollinations 圖片生成逾時。")
+                return image_bytes, "jpg", None
+    except asyncio.TimeoutError:
+        logging.error("Cloudflare AI 圖片生成逾時。")
         return None, None, "圖片生成逾時"
     except aiohttp.ClientError as error:
         logging.error(
-            "Pollinations 連線失敗：%s",
+            "Cloudflare AI 連線失敗：%s",
             error,
         )
         return None, None, "圖片服務連線失敗"
     except Exception:
-        logging.exception("AI 封面處理發生未預期錯誤。")
+        logging.exception(
+            "Cloudflare AI 封面處理發生未預期錯誤。"
+        )
         return None, None, "圖片處理發生錯誤"
 
 def get_discord_proxy_url(url: str | None) -> str | None:
