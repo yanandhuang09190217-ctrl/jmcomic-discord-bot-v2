@@ -1,3 +1,5 @@
 discord.py
 jmcomic
 groq
+flask
+waitress
